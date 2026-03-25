@@ -65,7 +65,8 @@ static SOCKET ipc_client_sockets[IPC_MAX_CLIENTS];
 static int    ipc_num_clients = 0;
 static bool   ipc_initialized = false;
 
-// Cover art buffer for IPC transmission
+// Cover art buffer — used for JPEG validation (header check) before committing file
+// Also tracks total size for IPC notification
 static uint8_t  cover_art_buffer[COVER_ART_MAX_SIZE];
 static uint32_t cover_art_buffer_offset = 0;
 static bool     cover_art_collecting = false;
@@ -85,9 +86,13 @@ static char prev_artist[256];
 static bool metadata_complete = false;  // true when all fields received for current track
 static uint32_t current_track_id = 0;
 static uint32_t pending_coverart_track_id = 0;
+static uint8_t cover_art_retry_count = 0;
+#define COVER_ART_MAX_RETRIES 2
 
 static void ipc_init(void) {
 #ifdef _WIN32
+    // Set console output to UTF-8 for proper CJK character display
+    SetConsoleOutputCP(65001);
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         printf("IPC: WSAStartup failed\n");
@@ -171,11 +176,10 @@ static void ipc_accept_clients(void) {
     }
 }
 
-// Send a JSON message to all connected IPC clients
+// Send a JSON message to all connected IPC clients (newline-delimited)
 static void ipc_send_json(const char *json) {
     if (!ipc_initialized) return;
 
-    // Send length-prefixed: 4 bytes big-endian length + JSON + newline
     char buf[IPC_SEND_BUF_SIZE];
     int total = snprintf(buf, sizeof(buf), "%s\n", json);
     if (total >= (int)sizeof(buf)) total = (int)sizeof(buf) - 1;
@@ -192,21 +196,20 @@ static void ipc_send_json(const char *json) {
         }
     }
 }
+static void json_escape(const char *src, char *dst, int dst_size);
 
-// Send binary data (cover art) to all connected IPC clients
-static void ipc_send_binary(const uint8_t *data, uint32_t size) {
-    if (!ipc_initialized) return;
-
-    for (int i = 0; i < IPC_MAX_CLIENTS; i++) {
-        if (ipc_client_sockets[i] == INVALID_SOCKET) continue;
-        int sent = send(ipc_client_sockets[i], (const char*)data, size, 0);
-        if (sent == SOCKET_ERROR) {
-            printf("IPC: Client disconnected during binary send (slot %d)\n", i);
-            closesocket(ipc_client_sockets[i]);
-            ipc_client_sockets[i] = INVALID_SOCKET;
-            ipc_num_clients--;
-        }
-    }
+// Send cover art notification (file path only — Python reads the file)
+static void ipc_send_event_cover_art_ready(uint32_t size, const char *path) {
+    char buf[512];
+    char path_esc[256];
+    json_escape(path, path_esc, sizeof(path_esc));
+#ifdef ENABLE_AVRCP_COVER_ART
+    snprintf(buf, sizeof(buf), "{\"type\":\"cover_art\",\"size\":%u,\"path\":\"%s\",\"track_id\":%u}",
+             (unsigned)size, path_esc, (unsigned)pending_coverart_track_id);
+#else
+    snprintf(buf, sizeof(buf), "{\"type\":\"cover_art\",\"size\":%u,\"path\":\"%s\"}", (unsigned)size, path_esc);
+#endif
+    ipc_send_json(buf);
 }
 
 // Simple JSON string escaper (handles \, ", newlines)
@@ -265,16 +268,6 @@ static void ipc_send_event_playback(const char *status) {
 static void ipc_send_event_volume(int percent, int raw) {
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"type\":\"volume\",\"percent\":%d,\"raw\":%d}", percent, raw);
-    ipc_send_json(buf);
-}
-
-static void ipc_send_event_cover_art_start(uint32_t size) {
-    char buf[128];
-#ifdef ENABLE_AVRCP_COVER_ART
-    snprintf(buf, sizeof(buf), "{\"type\":\"cover_art\",\"size\":%u,\"track_id\":%u}", (unsigned)size, (unsigned)pending_coverart_track_id);
-#else
-    snprintf(buf, sizeof(buf), "{\"type\":\"cover_art\",\"size\":%u}", (unsigned)size);
-#endif
     ipc_send_json(buf);
 }
 
@@ -410,6 +403,7 @@ static l2cap_ertm_config_t a2dp_sink_demo_ertm_config = {
 static bool a2dp_sink_cover_art_download_active;
 static uint32_t a2dp_sink_cover_art_file_size;
 static const char * a2dp_sink_demo_thumbnail_path = "cover.jpg";
+static const char * a2dp_sink_demo_thumbnail_tmp_path = "cover.jpg.tmp";
 static FILE * a2dp_sink_cover_art_file;
 // Flag to auto-download cover art when handle is received
 static bool auto_download_cover_art_pending = false;
@@ -461,6 +455,41 @@ static a2dp_sink_demo_avrcp_connection_t a2dp_sink_demo_avrcp_connection;
 // Timer for IPC polling
 static btstack_timer_source_t ipc_poll_timer;
 #define IPC_POLL_INTERVAL_MS 50
+
+// Timer for cover art catchup (re-request metadata if cover art wasn't received)
+#ifdef ENABLE_AVRCP_COVER_ART
+static btstack_timer_source_t cover_art_catchup_timer;
+#define COVER_ART_CATCHUP_MS 2000
+static bool cover_art_catchup_active = false;
+
+static void cover_art_catchup_handler(btstack_timer_source_t *ts) {
+    UNUSED(ts);
+    cover_art_catchup_active = false;
+    a2dp_sink_demo_avrcp_connection_t *avrcp = &a2dp_sink_demo_avrcp_connection;
+    if (avrcp->avrcp_cid == 0) return;
+    if (metadata_complete) return;  // Already got everything
+
+    printf("Cover Art: catchup timer fired, re-requesting now playing info\n");
+    avrcp_controller_get_now_playing_info(avrcp->avrcp_cid);
+}
+
+static void cover_art_catchup_start(void) {
+    if (cover_art_catchup_active) {
+        btstack_run_loop_remove_timer(&cover_art_catchup_timer);
+    }
+    btstack_run_loop_set_timer(&cover_art_catchup_timer, COVER_ART_CATCHUP_MS);
+    cover_art_catchup_timer.process = cover_art_catchup_handler;
+    btstack_run_loop_add_timer(&cover_art_catchup_timer);
+    cover_art_catchup_active = true;
+}
+
+static void cover_art_catchup_cancel(void) {
+    if (cover_art_catchup_active) {
+        btstack_run_loop_remove_timer(&cover_art_catchup_timer);
+        cover_art_catchup_active = false;
+    }
+}
+#endif
 
 // Forward declarations
 static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
@@ -765,11 +794,24 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
     UNUSED(channel);
     UNUSED(size);
     if (packet_type != HCI_EVENT_PACKET) return;
-    if (hci_event_packet_get_type(packet) == HCI_EVENT_PIN_CODE_REQUEST) {
-        bd_addr_t address;
-        printf("Pin code request - using '0000'\n");
-        hci_event_pin_code_request_get_bd_addr(packet, address);
-        gap_pin_code_response(address, "0000");
+    switch (hci_event_packet_get_type(packet)) {
+        case HCI_EVENT_PIN_CODE_REQUEST: {
+            bd_addr_t address;
+            printf("Pin code request - using '0000'\n");
+            hci_event_pin_code_request_get_bd_addr(packet, address);
+            gap_pin_code_response(address, "0000");
+            break;
+        }
+        case BTSTACK_EVENT_STATE:
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                bd_addr_t local_addr;
+                gap_local_bd_addr(local_addr);
+                printf("BTstack ready, addr %s\n", bd_addr_to_str(local_addr));
+                ipc_send_event_btstack_ready(bd_addr_to_str(local_addr));
+            }
+            break;
+        default:
+            break;
     }
 }
 
@@ -809,6 +851,12 @@ static void a2dp_sink_demo_cover_art_packet_handler(uint8_t packet_type, uint16_
                             if (status == ERROR_CODE_SUCCESS){
                                 printf("Cover Art: connection established, cid 0x%02x\n", cid);
                                 a2dp_sink_demo_cover_art_client_connected = true;
+                                // If we haven't gotten cover art yet (initial connect case),
+                                // re-request now playing info so the handle arrives while BIP is ready
+                                if (!metadata_complete && a2dp_sink_demo_avrcp_connection.avrcp_cid != 0) {
+                                    printf("Cover Art: re-requesting now playing info for initial track\n");
+                                    avrcp_controller_get_now_playing_info(a2dp_sink_demo_avrcp_connection.avrcp_cid);
+                                }
                             } else {
                                 printf("Cover Art: connection failed, status 0x%02x\n", status);
                                 a2dp_sink_demo_cover_art_cid = 0;
@@ -822,14 +870,49 @@ static void a2dp_sink_demo_cover_art_packet_handler(uint8_t packet_type, uint16_
                                     fclose(a2dp_sink_cover_art_file);
                                     a2dp_sink_cover_art_file = NULL;
                                 }
-                                // Guard: only send to GUI if the cover art belongs to the current track
-                                if (pending_coverart_track_id == current_track_id && cover_art_collecting && cover_art_buffer_offset > 0) {
-                                    ipc_send_event_cover_art_start(cover_art_buffer_offset);
-                                    ipc_send_binary(cover_art_buffer, cover_art_buffer_offset);
-                                    printf("Cover Art: sent %u bytes for track %u\n", cover_art_buffer_offset, current_track_id);
+
+                                // Validate: must be current track, have data, and be a plausible JPEG
+                                // JPEG starts with FF D8, minimum useful size ~1KB
+                                bool is_valid_jpeg = (cover_art_buffer_offset >= 1024
+                                    && cover_art_buffer[0] == 0xFF
+                                    && cover_art_buffer[1] == 0xD8);
+
+                                if (pending_coverart_track_id == current_track_id
+                                    && cover_art_collecting && is_valid_jpeg) {
+                                    // Atomic rename: tmp -> cover.jpg (overwrites previous)
+                                    remove(a2dp_sink_demo_thumbnail_path);
+                                    rename(a2dp_sink_demo_thumbnail_tmp_path, a2dp_sink_demo_thumbnail_path);
+                                    // Notify Python via IPC (file path only, no binary transfer)
+                                    ipc_send_event_cover_art_ready(cover_art_buffer_offset, a2dp_sink_demo_thumbnail_path);
+                                    printf("Cover Art: committed %u bytes for track %u\n", cover_art_buffer_offset, current_track_id);
+                                    cover_art_retry_count = 0;
+                                    cover_art_catchup_cancel();
                                 } else {
-                                    printf("Cover Art: discarded stale art (track %u vs current %u)\n",
-                                           pending_coverart_track_id, current_track_id);
+                                    // Invalid or stale — delete temp, keep previous cover.jpg
+                                    remove(a2dp_sink_demo_thumbnail_tmp_path);
+                                    if (!is_valid_jpeg && cover_art_buffer_offset > 0
+                                        && pending_coverart_track_id == current_track_id) {
+                                        printf("Cover Art: rejected invalid data (%u bytes, header %02X %02X) for track %u\n",
+                                               cover_art_buffer_offset,
+                                               cover_art_buffer_offset > 0 ? cover_art_buffer[0] : 0,
+                                               cover_art_buffer_offset > 1 ? cover_art_buffer[1] : 0,
+                                               pending_coverart_track_id);
+                                        // Allow retry: rollback prev_image_handle so next duplicate
+                                        // notification triggers a re-download attempt
+                                        if (cover_art_retry_count < COVER_ART_MAX_RETRIES) {
+                                            cover_art_retry_count++;
+                                            memset(prev_image_handle, 0, sizeof(prev_image_handle));
+                                            metadata_complete = false;
+                                            printf("Cover Art: will retry (%d/%d)\n", cover_art_retry_count, COVER_ART_MAX_RETRIES);
+                                            avrcp_controller_get_now_playing_info(a2dp_sink_demo_avrcp_connection.avrcp_cid);
+                                        } else {
+                                            printf("Cover Art: max retries reached, giving up\n");
+                                            cover_art_retry_count = 0;
+                                        }
+                                    } else {
+                                        printf("Cover Art: discarded stale art (track %u vs current %u)\n",
+                                               pending_coverart_track_id, current_track_id);
+                                    }
                                 }
                                 cover_art_collecting = false;
                                 cover_art_buffer_offset = 0;
@@ -840,6 +923,11 @@ static void a2dp_sink_demo_cover_art_packet_handler(uint8_t packet_type, uint16_
                             a2dp_sink_demo_cover_art_client_connected = false;
                             a2dp_sink_demo_cover_art_cid = 0;
                             printf("Cover Art: connection released\n");
+                            // Auto-reconnect if AVRCP is still connected
+                            if (a2dp_sink_demo_avrcp_connection.avrcp_cid != 0) {
+                                printf("Cover Art: auto-reconnecting...\n");
+                                a2dp_sink_demo_cover_art_connect();
+                            }
                             break;
                         default:
                             break;
@@ -870,8 +958,8 @@ static void trigger_cover_art_download(void) {
 
     printf("Cover Art: auto-downloading '%s'\n", a2dp_sink_demo_image_handle);
 
-    // Open file for writing
-    a2dp_sink_cover_art_file = fopen(a2dp_sink_demo_thumbnail_path, "wb");
+    // Open temp file for writing (will rename to cover.jpg on success)
+    a2dp_sink_cover_art_file = fopen(a2dp_sink_demo_thumbnail_tmp_path, "wb");
 
     // Prepare IPC buffer
     cover_art_collecting = true;
@@ -963,6 +1051,11 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
             avrcp_controller_enable_notification(a2dp_sink_demo_avrcp_connection.avrcp_cid, AVRCP_NOTIFICATION_EVENT_UIDS_CHANGED);
             a2dp_sink_demo_cover_art_connect();
 #endif
+            // Initial fetch: get current track metadata + playback status
+            // This covers the case where music is already playing at connection time
+            printf("AVRCP: Initial now playing request\n");
+            avrcp_controller_get_now_playing_info(avrcp_connection->avrcp_cid);
+            avrcp_controller_get_play_status(avrcp_connection->avrcp_cid);
             break;
 
         case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
@@ -991,25 +1084,21 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 
         case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
             printf("AVRCP: Track changed\n");
-            // New track: bump ID so any in-flight cover art download is invalidated
-            current_track_id++;
-            // Reset metadata for new track
+            // Reset metadata for new track, but DON'T abort cover art download yet.
+            // iPhone sends duplicate TRACK_CHANGED for the same track — we defer
+            // download cancellation to COVER_ART_INFO where we can check the handle.
             metadata_complete = false;
             memset(current_title, 0, sizeof(current_title));
             memset(current_artist, 0, sizeof(current_artist));
             memset(current_album, 0, sizeof(current_album));
             memset(current_genre, 0, sizeof(current_genre));
             memset(current_image_handle, 0, sizeof(current_image_handle));
-#ifdef ENABLE_AVRCP_COVER_ART
-            // Invalidate any in-progress cover art download for the previous track
-            auto_download_cover_art_pending = false;
-            cover_art_collecting = false;
-            cover_art_buffer_offset = 0;
-            a2dp_sink_cover_art_download_active = false;
-            pending_coverart_track_id = 0;
-#endif
             // Auto-request metadata on track change
             avrcp_controller_get_now_playing_info(avrcp_connection->avrcp_cid);
+#ifdef ENABLE_AVRCP_COVER_ART
+            // Start catchup timer — if cover art isn't received within 2s, re-request
+            cover_art_catchup_start();
+#endif
             break;
 
         case AVRCP_SUBEVENT_NOTIFICATION_NOW_PLAYING_CONTENT_CHANGED:
@@ -1067,18 +1156,34 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 
                 if (title_changed || artist_changed || handle_changed) {
                     // New track — send metadata and queue cover art download
+                    current_track_id++;
+                    cover_art_retry_count = 0;
                     metadata_complete = true;
                     memcpy(prev_title,        current_title,        sizeof(prev_title));
                     memcpy(prev_artist,       current_artist,       sizeof(prev_artist));
                     memcpy(prev_image_handle, current_image_handle, sizeof(prev_image_handle));
                     ipc_send_event_metadata();
                     if (handle_changed) {
+                        // Abort any in-progress download for the previous track
+                        if (a2dp_sink_cover_art_download_active) {
+                            if (a2dp_sink_cover_art_file) {
+                                fclose(a2dp_sink_cover_art_file);
+                                a2dp_sink_cover_art_file = NULL;
+                            }
+                            a2dp_sink_cover_art_download_active = false;
+                            cover_art_collecting = false;
+                            cover_art_buffer_offset = 0;
+                            remove(a2dp_sink_demo_thumbnail_tmp_path);
+                            printf("Cover Art: aborted previous download (new handle)\n");
+                        }
                         // Stamp this download request with the current track ID
                         pending_coverart_track_id = current_track_id;
                         auto_download_cover_art_pending = true;
                     }
                     printf("AVRCP: New track detected, sending metadata\n");
                 } else {
+                    // Same track — duplicate notification, let current download continue
+                    metadata_complete = true;
                     printf("AVRCP: Duplicate track notification, skipping\n");
                 }
             }
@@ -1086,7 +1191,8 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 
         case AVRCP_SUBEVENT_NOTIFICATION_EVENT_UIDS_CHANGED:
             if (a2dp_sink_demo_cover_art_client_connected){
-                printf("AVRCP: UIDs changed -> disconnect cover art client\n");
+                printf("AVRCP: UIDs changed -> disconnect cover art client (will auto-reconnect)\n");
+                metadata_complete = false;  // Force re-fetch after reconnect
                 avrcp_cover_art_client_disconnect(a2dp_sink_demo_cover_art_cid);
             }
             break;
@@ -1105,8 +1211,30 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
         case AVRCP_SUBEVENT_OPERATION_COMPLETE:
             break;
 
-        case AVRCP_SUBEVENT_PLAY_STATUS:
+        case AVRCP_SUBEVENT_PLAY_STATUS: {
+            uint8_t initial_play_status = avrcp_subevent_play_status_get_play_status(packet);
+            switch (initial_play_status) {
+                case AVRCP_PLAYBACK_STATUS_PLAYING:
+                    snprintf(current_playback_status, sizeof(current_playback_status), "playing");
+                    avrcp_connection->playing = true;
+                    break;
+                case AVRCP_PLAYBACK_STATUS_PAUSED:
+                    snprintf(current_playback_status, sizeof(current_playback_status), "paused");
+                    avrcp_connection->playing = false;
+                    break;
+                case AVRCP_PLAYBACK_STATUS_STOPPED:
+                    snprintf(current_playback_status, sizeof(current_playback_status), "stopped");
+                    avrcp_connection->playing = false;
+                    break;
+                default:
+                    snprintf(current_playback_status, sizeof(current_playback_status), "unknown");
+                    avrcp_connection->playing = false;
+                    break;
+            }
+            printf("AVRCP: Play status query result: %s\n", current_playback_status);
+            ipc_send_event_playback(current_playback_status);
             break;
+        }
 
         default:
             break;

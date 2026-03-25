@@ -30,7 +30,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Please inquire about commercial licensing options at 
+ * Please inquire about commercial licensing options at
  * contact@bluekitchen-gmbh.com
  *
  */
@@ -52,7 +52,9 @@
 #include "btstack_config.h"
 
 #include "ble/le_device_db_tlv.h"
+#include "bluetooth_company_id.h"
 #include "btstack_audio.h"
+#include "btstack_chipset_realtek.h"
 #include "btstack_debug.h"
 #include "btstack_event.h"
 #include "btstack_memory.h"
@@ -83,31 +85,50 @@ static bool shutdown_triggered;
 
 static void packet_handler (uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     if (packet_type != HCI_EVENT_PACKET) return;
-    if (hci_event_packet_get_type(packet) != BTSTACK_EVENT_STATE) return;
-    switch (btstack_event_state_get_state(packet)){
-        case HCI_STATE_WORKING:
-            gap_local_bd_addr(local_addr);
-            printf("BTstack up and running on %s.\n", bd_addr_to_str(local_addr));
-            btstack_strcpy(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_PREFIX);
-            btstack_strcat(tlv_db_path, sizeof(tlv_db_path), bd_addr_to_str_with_delimiter(local_addr, '-'));
-            btstack_strcat(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_POSTFIX);
-            tlv_impl = btstack_tlv_windows_init_instance(&tlv_context, tlv_db_path);
-            btstack_tlv_set_instance(tlv_impl, &tlv_context);
+    switch (hci_event_packet_get_type(packet)) {
+        case BTSTACK_EVENT_STATE:
+            switch (btstack_event_state_get_state(packet)){
+                case HCI_STATE_WORKING:
+                    gap_local_bd_addr(local_addr);
+                    printf("BTstack up and running on %s.\n", bd_addr_to_str(local_addr));
+                    btstack_strcpy(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_PREFIX);
+                    btstack_strcat(tlv_db_path, sizeof(tlv_db_path), bd_addr_to_str_with_delimiter(local_addr, '-'));
+                    btstack_strcat(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_POSTFIX);
+                    tlv_impl = btstack_tlv_windows_init_instance(&tlv_context, tlv_db_path);
+                    btstack_tlv_set_instance(tlv_impl, &tlv_context);
 #ifdef ENABLE_CLASSIC
-            hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
+                    hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
 #endif
 #ifdef ENABLE_BLE
-            le_device_db_tlv_configure(tlv_impl, &tlv_context);
+                    le_device_db_tlv_configure(tlv_impl, &tlv_context);
 #endif
+                    break;
+                case HCI_STATE_OFF:
+                    btstack_tlv_windows_deinit(&tlv_context);
+                    if (!shutdown_triggered) break;
+                    // reset stdin
+                    btstack_stdin_reset();
+                    log_info("Good bye, see you.\n");
+                    exit(0);
+                    break;
+                default:
+                    break;
+            }
             break;
-        case HCI_STATE_OFF:
-            btstack_tlv_windows_deinit(&tlv_context);
-            if (!shutdown_triggered) break;
-            // reset stdin
-            btstack_stdin_reset();
-            log_info("Good bye, see you.\n");
-            exit(0);
+        case HCI_EVENT_TRANSPORT_USB_INFO:
+        {
+            uint16_t vendor_id  = hci_event_transport_usb_info_get_vendor_id(packet);
+            uint16_t product_id = hci_event_transport_usb_info_get_product_id(packet);
+            printf("USB device: vendor_id 0x%04x, product_id 0x%04x\n", vendor_id, product_id);
+            // Realtek chipset detection
+            if (vendor_id == BLUETOOTH_COMPANY_ID_REALTEK_SEMICONDUCTOR_CORPORATION || vendor_id == 0x2357) {
+                printf("Realtek Controller detected - enabling firmware download\n");
+                btstack_chipset_realtek_set_product_id(product_id);
+                hci_set_chipset(btstack_chipset_realtek_instance());
+                hci_enable_custom_pre_init();
+            }
             break;
+        }
         default:
             break;
     }
@@ -147,6 +168,22 @@ int main(int argc, const char * argv[]){
 
     // init HCI
     hci_init(hci_transport_usb_instance(), NULL);
+    // Force Realtek chipset for TP-Link UB500 (RTL8761B)
+    btstack_chipset_realtek_set_product_id(0x0604);
+    hci_set_chipset(btstack_chipset_realtek_instance());
+    hci_enable_custom_pre_init();
+
+    // register known Realtek USB Controllers
+    uint16_t realtek_num_controllers = btstack_chipset_realtek_get_num_usb_controllers();
+    uint16_t i;
+    for (i = 0; i < realtek_num_controllers; i++){
+        uint16_t vendor_id;
+        uint16_t product_id;
+        btstack_chipset_realtek_get_vendor_product_id(i, &vendor_id, &product_id);
+        hci_transport_usb_add_device(vendor_id, product_id);
+    }
+    // Also register TP-Link UB500 (uses Realtek RTL8761B but with TP-Link VID)
+    hci_transport_usb_add_device(0x2357, 0x0604);
 
 #ifdef HAVE_PORTAUDIO
     btstack_audio_sink_set_instance(btstack_audio_portaudio_sink_get_instance());

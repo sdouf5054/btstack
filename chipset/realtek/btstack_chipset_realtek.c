@@ -295,6 +295,7 @@ static const patch_info_usb fw_patch_table_usb[] = {
     {0xc03f, 0x8822, "mp_rtl8822cu_fw", "rtl8822cu_fw", "rtl8822cu_config", NULL, 0, RTL8822CU}, /* RTL8822CE-VS */
 
     {0x8771, 0x8761, "mp_rtl8761b_fw", "rtl8761bu_fw", "rtl8761bu_config", NULL, 0, RTL8761BU}, /* RTL8761BU only */
+    {0x0604, 0x8761, "mp_rtl8761b_fw", "rtl8761bu_fw", "rtl8761bu_config", NULL, 0, RTL8761BU}, /* TP-Link UB500 (RTL8761B) */
     {0xa725, 0x8761, "mp_rtl8761b_fw", "rtl8725au_fw", "rtl8725au_config", NULL, 0, RTL8761BU}, /* RTL8725AU */
     {0xa72A, 0x8761, "mp_rtl8761b_fw", "rtl8725au_fw", "rtl8725au_config", NULL, 0, RTL8761BU}, /* RTL8725AU BT only */
 

@@ -35,6 +35,7 @@ include_directories(../../3rd-party/hxcmod-player/mod)
 include_directories(../../3rd-party/rijndael)
 include_directories(../../3rd-party/yxml)
 include_directories(../../src)
+include_directories(../../chipset/realtek)
 include_directories(../../chipset/zephyr)
 include_directories(../../platform/embedded)
 include_directories(../../platform/posix)
@@ -51,6 +52,7 @@ file(GLOB SOURCES_MD5       "../../3rd-party/md5/md5.c")
 file(GLOB SOURCES_RIJNDAEL  "../../3rd-party/rijndael/rijndael.c")
 file(GLOB SOURCES_WINDOWS   "../../platform/windows/*.c")
 file(GLOB SOURCES_ZEPHYR    "../../chipset/zephyr/*.c")
+file(GLOB SOURCES_REALTEK   "../../chipset/realtek/*.c")
 file(GLOB SOURCES_LC3_GOOGLE "../../3rd-party/lc3-google/src/*.c")
 file(GLOB SOURCES_PORT      "main.c" "../../platform/posix/btstack_audio_portaudio.c")
 file(GLOB SOURCES_YXML      "../../3rd-party/yxml/yxml.c")
@@ -72,6 +74,7 @@ set(SOURCES
  ${SOURCES_WINDOWS}
  ${SOURCES_YXML}
  ${SOURCES_ZEPHYR}
+ ${SOURCES_REALTEK}
 )
 list(SORT SOURCES)
 
@@ -120,3 +123,7 @@ foreach(EXAMPLE ${EXAMPLES})
     add_executable(${EXAMPLE} ${SOURCES_EXAMPLE})
     target_link_libraries(${EXAMPLE} btstack setupapi winusb)
 endforeach(EXAMPLE)
+
+# Bluetooth Media Bridge
+add_executable(bt_bridge ${CMAKE_SOURCE_DIR}/bt_bridge.c)
+target_link_libraries(bt_bridge btstack setupapi winusb ws2_32)

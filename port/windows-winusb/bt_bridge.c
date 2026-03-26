@@ -89,6 +89,91 @@ static uint32_t pending_coverart_track_id = 0;
 static uint8_t cover_art_retry_count = 0;
 #define COVER_ART_MAX_RETRIES 2
 
+// ============================================================================
+// Auto-reconnect to last connected device
+// ============================================================================
+
+#define LAST_DEVICE_FILE "last_device.txt"
+#define AUTO_RECONNECT_INITIAL_DELAY_MS 2000
+#define AUTO_RECONNECT_RETRY_DELAY_MS   5000
+#define AUTO_RECONNECT_MAX_RETRIES      5
+
+static bd_addr_t   last_connected_addr;
+static bool        last_connected_addr_valid = false;
+static bool        auto_reconnect_enabled = true;
+static int         auto_reconnect_attempt = 0;
+static bool        auto_reconnect_active = false;
+static btstack_timer_source_t auto_reconnect_timer;
+
+// Forward declarations for auto-reconnect
+static void auto_reconnect_save_addr(const bd_addr_t addr);
+static bool auto_reconnect_load_addr(bd_addr_t addr);
+static void auto_reconnect_start(void);
+static void auto_reconnect_stop(void);
+static void auto_reconnect_timer_handler(btstack_timer_source_t *ts);
+static void auto_reconnect_try_connect(void);
+
+static void auto_reconnect_save_addr(const bd_addr_t addr) {
+    FILE *f = fopen(LAST_DEVICE_FILE, "w");
+    if (f) {
+        fprintf(f, "%s\n", bd_addr_to_str(addr));
+        fclose(f);
+        printf("Auto-reconnect: Saved device %s\n", bd_addr_to_str(addr));
+    }
+}
+
+static bool auto_reconnect_load_addr(bd_addr_t addr) {
+    FILE *f = fopen(LAST_DEVICE_FILE, "r");
+    if (!f) return false;
+    char line[32];
+    if (fgets(line, sizeof(line), f)) {
+        fclose(f);
+        // Trim newline
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        nl = strchr(line, '\r');
+        if (nl) *nl = '\0';
+        if (strlen(line) == 17) {  // "XX:XX:XX:XX:XX:XX"
+            unsigned int b[6];
+            if (sscanf(line, "%x:%x:%x:%x:%x:%x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
+                for (int i = 0; i < 6; i++) addr[i] = (uint8_t)b[i];
+                printf("Auto-reconnect: Loaded device %s\n", line);
+                return true;
+            }
+        }
+    } else {
+        fclose(f);
+    }
+    return false;
+}
+
+// auto_reconnect_try_connect: defined after struct declarations (see below)
+
+static void auto_reconnect_timer_handler(btstack_timer_source_t *ts) {
+    UNUSED(ts);
+    auto_reconnect_try_connect();
+}
+
+static void auto_reconnect_start(void) {
+    if (!auto_reconnect_enabled) return;
+    if (!last_connected_addr_valid) return;
+    if (auto_reconnect_active) return;
+    auto_reconnect_active = true;
+    auto_reconnect_attempt = 0;
+    printf("Auto-reconnect: Starting in %d ms\n", AUTO_RECONNECT_INITIAL_DELAY_MS);
+    btstack_run_loop_set_timer(&auto_reconnect_timer, AUTO_RECONNECT_INITIAL_DELAY_MS);
+    auto_reconnect_timer.process = auto_reconnect_timer_handler;
+    btstack_run_loop_add_timer(&auto_reconnect_timer);
+}
+
+static void auto_reconnect_stop(void) {
+    if (auto_reconnect_active) {
+        btstack_run_loop_remove_timer(&auto_reconnect_timer);
+        auto_reconnect_active = false;
+        printf("Auto-reconnect: Stopped\n");
+    }
+}
+
 static void ipc_init(void) {
 #ifdef _WIN32
     // Set console output to UTF-8 for proper CJK character display
@@ -388,7 +473,7 @@ static btstack_resample_t resample_instance;
 static int16_t * request_buffer;
 static int       request_frames;
 
-static int volume_percentage = 0;
+static int volume_percentage = -1;  // -1 = unknown until first sync from device
 static avrcp_battery_status_t battery_status = AVRCP_BATTERY_STATUS_WARNING;
 
 #ifdef ENABLE_AVRCP_COVER_ART
@@ -452,6 +537,35 @@ typedef struct {
 } a2dp_sink_demo_avrcp_connection_t;
 static a2dp_sink_demo_avrcp_connection_t a2dp_sink_demo_avrcp_connection;
 
+// ── Auto-reconnect: try_connect (needs struct declarations above) ──
+static void auto_reconnect_try_connect(void) {
+    if (!last_connected_addr_valid) return;
+    // Don't reconnect if already connected
+    if (a2dp_sink_demo_avrcp_connection.avrcp_cid != 0) {
+        printf("Auto-reconnect: Already connected, skipping\n");
+        auto_reconnect_active = false;
+        return;
+    }
+    auto_reconnect_attempt++;
+    printf("Auto-reconnect: Attempt %d/%d to %s\n",
+           auto_reconnect_attempt, AUTO_RECONNECT_MAX_RETRIES,
+           bd_addr_to_str(last_connected_addr));
+    // Initiate A2DP connection — btstack API: (addr, &out_cid)
+    uint16_t a2dp_cid;
+    uint8_t status = a2dp_sink_establish_stream(last_connected_addr, &a2dp_cid);
+    if (status != ERROR_CODE_SUCCESS) {
+        printf("Auto-reconnect: a2dp_sink_establish_stream failed (0x%02x)\n", status);
+        if (auto_reconnect_attempt < AUTO_RECONNECT_MAX_RETRIES) {
+            btstack_run_loop_set_timer(&auto_reconnect_timer, AUTO_RECONNECT_RETRY_DELAY_MS);
+            auto_reconnect_timer.process = auto_reconnect_timer_handler;
+            btstack_run_loop_add_timer(&auto_reconnect_timer);
+        } else {
+            printf("Auto-reconnect: Gave up after %d attempts\n", AUTO_RECONNECT_MAX_RETRIES);
+            auto_reconnect_active = false;
+        }
+    }
+}
+
 // Timer for IPC polling
 static btstack_timer_source_t ipc_poll_timer;
 #define IPC_POLL_INTERVAL_MS 50
@@ -498,6 +612,7 @@ static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t *packet, uint16
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+static void avrcp_volume_changed(uint8_t volume);
 #ifdef HAVE_BTSTACK_STDIN
 static void stdin_process(char cmd);
 #endif
@@ -513,6 +628,52 @@ static uint8_t a2dp_sink_demo_cover_art_connect(void);
 // ============================================================================
 
 static void ipc_handle_command(const char *cmd) {
+    // Shutdown command — works regardless of AVRCP state
+    if (strstr(cmd, "\"shutdown\"")) {
+        printf("IPC: shutdown — powering off HCI\n");
+        auto_reconnect_stop();
+        hci_power_control(HCI_POWER_OFF);
+        return;
+    }
+
+    // Auto-reconnect toggle — works regardless of AVRCP state
+    if (strstr(cmd, "\"set_auto_reconnect\"")) {
+        if (strstr(cmd, "true")) {
+            auto_reconnect_enabled = true;
+            printf("IPC: auto_reconnect enabled\n");
+        } else {
+            auto_reconnect_enabled = false;
+            auto_reconnect_stop();
+            printf("IPC: auto_reconnect disabled\n");
+        }
+        return;
+    }
+
+    // Disconnect BT only — keep engine running (discoverable)
+    if (strstr(cmd, "\"disconnect\"")) {
+        printf("IPC: disconnect — dropping BT connection\n");
+        auto_reconnect_stop();  // Don't auto-reconnect after manual disconnect
+        a2dp_sink_demo_a2dp_connection_t *a2dp = &a2dp_sink_demo_a2dp_connection;
+        if (a2dp->a2dp_cid != 0) {
+            a2dp_sink_disconnect(a2dp->a2dp_cid);
+        }
+        return;
+    }
+
+    // Manually trigger connection to last known device
+    if (strstr(cmd, "\"connect\"")) {
+        printf("IPC: connect — attempting connection to last device\n");
+        if (last_connected_addr_valid) {
+            auto_reconnect_stop();
+            auto_reconnect_attempt = 0;
+            auto_reconnect_active = true;
+            auto_reconnect_try_connect();
+        } else {
+            printf("IPC: connect — no last device known, waiting for incoming\n");
+        }
+        return;
+    }
+
     a2dp_sink_demo_avrcp_connection_t *avrcp = &a2dp_sink_demo_avrcp_connection;
     if (avrcp->avrcp_cid == 0) {
         printf("IPC: Command '%s' ignored - no AVRCP connection\n", cmd);
@@ -535,16 +696,6 @@ static void ipc_handle_command(const char *cmd) {
     } else if (strstr(cmd, "\"prev\"")) {
         printf("IPC: prev\n");
         avrcp_controller_backward(avrcp->avrcp_cid);
-    } else if (strstr(cmd, "\"volume_up\"")) {
-        volume_percentage = volume_percentage <= 90 ? volume_percentage + 10 : 100;
-        uint8_t volume = volume_percentage * 127 / 100;
-        avrcp_target_volume_changed(avrcp->avrcp_cid, volume);
-        printf("IPC: volume up to %d%%\n", volume_percentage);
-    } else if (strstr(cmd, "\"volume_down\"")) {
-        volume_percentage = volume_percentage >= 10 ? volume_percentage - 10 : 0;
-        uint8_t volume = volume_percentage * 127 / 100;
-        avrcp_target_volume_changed(avrcp->avrcp_cid, volume);
-        printf("IPC: volume down to %d%%\n", volume_percentage);
     } else if (strstr(cmd, "\"get_metadata\"")) {
         printf("IPC: get_metadata\n");
         avrcp_controller_get_now_playing_info(avrcp->avrcp_cid);
@@ -577,7 +728,9 @@ static void playback_handler(int16_t * buffer, uint16_t num_audio_frames, const 
     int       wav_samples = num_audio_frames * NUM_CHANNELS;
     int16_t * wav_buffer  = buffer;
 #endif
-    if (sbc_frame_size == 0){
+    // Mute until first AVRCP volume is received from iPhone
+    // This prevents audio glitches during the A2DP/AVRCP sync gap
+    if (volume_percentage < 0 || sbc_frame_size == 0){
         memset(buffer, 0, num_audio_frames * BYTES_PER_FRAME);
         return;
     }
@@ -808,6 +961,12 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 gap_local_bd_addr(local_addr);
                 printf("BTstack ready, addr %s\n", bd_addr_to_str(local_addr));
                 ipc_send_event_btstack_ready(bd_addr_to_str(local_addr));
+
+                // Load last connected device and attempt auto-reconnect
+                if (auto_reconnect_load_addr(last_connected_addr)) {
+                    last_connected_addr_valid = true;
+                    auto_reconnect_start();
+                }
             }
             break;
         default:
@@ -1003,6 +1162,12 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             // Store address for outgoing connections
             avrcp_subevent_connection_established_get_bd_addr(packet, device_addr);
 
+            // Save for auto-reconnect on next startup
+            auto_reconnect_stop();
+            memcpy(last_connected_addr, address, 6);
+            last_connected_addr_valid = true;
+            auto_reconnect_save_addr(address);
+
             avrcp_target_support_event(connection->avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
             avrcp_target_support_event(connection->avrcp_cid, AVRCP_NOTIFICATION_EVENT_BATT_STATUS_CHANGED);
             avrcp_target_battery_status_changed(connection->avrcp_cid, battery_status);
@@ -1016,6 +1181,7 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             printf("AVRCP: Channel released: cid 0x%02x\n", avrcp_subevent_connection_released_get_avrcp_cid(packet));
             connection->avrcp_cid = 0;
             connection->notifications_supported_by_target = 0;
+            volume_percentage = -1;
             ipc_send_event_disconnected();
             return;
         default:
@@ -1249,6 +1415,11 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 #endif
 }
 
+// Volume: PortAudio output is always at max (127).
+// Actual volume control is handled by the iPhone (source device),
+// just like a normal Bluetooth speaker.
+// We only track volume_percentage for IPC reporting to the GUI.
+
 static void avrcp_volume_changed(uint8_t volume){
     const btstack_audio_sink_t * audio = btstack_audio_sink_get_instance();
     if (audio){
@@ -1333,6 +1504,16 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             status = a2dp_subevent_stream_established_get_status(packet);
             if (status != ERROR_CODE_SUCCESS){
                 printf("A2DP: Streaming connection failed, status 0x%02x\n", status);
+                // If this was an auto-reconnect attempt, schedule retry
+                if (auto_reconnect_active && auto_reconnect_attempt < AUTO_RECONNECT_MAX_RETRIES) {
+                    printf("Auto-reconnect: Will retry in %d ms\n", AUTO_RECONNECT_RETRY_DELAY_MS);
+                    btstack_run_loop_set_timer(&auto_reconnect_timer, AUTO_RECONNECT_RETRY_DELAY_MS);
+                    auto_reconnect_timer.process = auto_reconnect_timer_handler;
+                    btstack_run_loop_add_timer(&auto_reconnect_timer);
+                } else if (auto_reconnect_active) {
+                    printf("Auto-reconnect: Gave up after %d attempts\n", auto_reconnect_attempt);
+                    auto_reconnect_active = false;
+                }
                 break;
             }
             a2dp_subevent_stream_established_get_bd_addr(packet, a2dp_conn->addr);
@@ -1341,6 +1522,7 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             a2dp_conn->stream_state = STREAM_STATE_OPEN;
             printf("A2DP: Stream established, addr %s\n", bd_addr_to_str(a2dp_conn->addr));
             memcpy(device_addr, a2dp_conn->addr, 6);
+            auto_reconnect_stop();  // Connection succeeded
             break;
 
         case A2DP_SUBEVENT_STREAM_STARTED:
@@ -1443,7 +1625,7 @@ static int setup_demo(void){
     sdp_register_service(device_id_sdp_service_buffer);
 
     // GAP configuration
-    gap_set_local_name("Bluetooth Media Bridge 00:00:00:00:00:00");
+    gap_set_local_name("BT Bridge");
     gap_discoverable_control(1);
     gap_set_class_of_device(0x200404);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
@@ -1518,19 +1700,19 @@ static void stdin_process(char cmd){
             status = avrcp_controller_backward(avrcp_connection->avrcp_cid);
             break;
         case 't':
+            if (volume_percentage < 0) volume_percentage = 50;
             volume_percentage = volume_percentage <= 90 ? volume_percentage + 10 : 100;
             {
                 uint8_t volume = volume_percentage * 127 / 100;
-                status = avrcp_target_volume_changed(avrcp_connection->avrcp_cid, volume);
-                avrcp_volume_changed(volume);
+                status = avrcp_controller_set_absolute_volume(avrcp_connection->avrcp_cid, volume);
             }
             break;
         case 'T':
+            if (volume_percentage < 0) volume_percentage = 50;
             volume_percentage = volume_percentage >= 10 ? volume_percentage - 10 : 0;
             {
                 uint8_t volume = volume_percentage * 127 / 100;
-                status = avrcp_target_volume_changed(avrcp_connection->avrcp_cid, volume);
-                avrcp_volume_changed(volume);
+                status = avrcp_controller_set_absolute_volume(avrcp_connection->avrcp_cid, volume);
             }
             break;
 #ifdef ENABLE_AVRCP_COVER_ART

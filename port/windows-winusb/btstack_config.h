@@ -14,6 +14,10 @@
 #define HAVE_POSIX_FILE_IO
 #define HAVE_POSIX_TIME
 
+// AAC codec support via fdk-aac library
+// Requires: pacman -S mingw-w64-x86_64-fdk-aac (MSYS2)
+#define HAVE_AAC_FDK
+
 // BTstack features that can be enabled
 #define ENABLE_AVRCP_COVER_ART
 #define ENABLE_BLE

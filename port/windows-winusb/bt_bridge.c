@@ -32,6 +32,10 @@
 
 #include "btstack_ring_buffer.h"
 
+#ifdef HAVE_AAC_FDK
+#include <fdk-aac/aacdecoder_lib.h>
+#endif
+
 #ifdef HAVE_POSIX_FILE_IO
 #include "wav_util.h"
 #define STORE_TO_WAV_FILE
@@ -88,6 +92,31 @@ static uint32_t current_track_id = 0;
 static uint32_t pending_coverart_track_id = 0;
 static uint8_t cover_art_retry_count = 0;
 #define COVER_ART_MAX_RETRIES 2
+
+// ============================================================================
+// Codec Selection
+// ============================================================================
+
+typedef enum {
+    CODEC_SBC = 0,
+    CODEC_AAC = 1,
+} active_codec_t;
+static active_codec_t active_codec = CODEC_SBC;
+
+// Codec preference from --codec CLI argument: "SBC", "AAC", or "both" (default)
+static const char * preferred_codec = "both";
+
+#ifdef HAVE_AAC_FDK
+// AAC decoder state (fdk-aac)
+static HANDLE_AACDECODER aac_decoder_handle = NULL;
+static bool aac_decoder_initialized = false;
+static uint32_t aac_sample_rate = 44100;
+static uint8_t  aac_num_channels = 2;
+
+// AAC PCM output buffer: 1024 samples * 2 channels
+#define AAC_PCM_FRAME_SIZE 1024
+static INT_PCM aac_pcm_buffer[AAC_PCM_FRAME_SIZE * 2];
+#endif
 
 // ============================================================================
 // Auto-reconnect to last connected device
@@ -364,6 +393,12 @@ static void ipc_send_event_stream_stopped(void) {
     ipc_send_json("{\"type\":\"stream_stopped\"}");
 }
 
+static void ipc_send_event_codec(const char *codec_name) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"type\":\"codec\",\"name\":\"%s\"}", codec_name);
+    ipc_send_json(buf);
+}
+
 static void ipc_send_event_btstack_ready(const char *addr) {
     char buf[256];
     snprintf(buf, sizeof(buf), "{\"type\":\"ready\",\"addr\":\"%s\"}", addr);
@@ -445,6 +480,31 @@ static uint8_t media_sbc_codec_capabilities[] = {
     0xFF, 0xFF, 2, 53
 };
 
+#ifdef HAVE_AAC_FDK
+// MPEG-2/4 AAC LC capabilities for A2DP Sink
+// Per A2DP spec section 4.5.2 (Media Codec – MPEG-2,4 AAC):
+//   Byte 0: Object Type flags (bit7=MPEG2-AAC-LC, bit6=MPEG4-AAC-LC, ...)
+//   Byte 1: Sampling Frequency upper (bit7=8000 .. bit0=44100)
+//   Byte 2: Sampling Freq lower (bit7=48000 ..) + Channels (bit3=1ch, bit2=2ch)
+//   Byte 3..5: VBR (bit7 of byte3) + Bit Rate (23-bit big-endian, max 320kbps)
+static uint8_t media_aac_codec_capabilities[] = {
+    0x80,       // Object Type: MPEG-2 AAC-LC
+    0x01,       // Sampling Freq: 44100 (bit 0)
+    0x8C,       // Sampling Freq: 48000 (bit 7) | Channels: stereo (bit 2)
+    0x80,       // VBR=1 | Bit Rate upper: 0x04E800 = 320000 bps
+    0xE8,       // Bit Rate middle
+    0x00,       // Bit Rate lower
+};
+
+static uint8_t media_aac_codec_configuration[6];
+
+typedef struct {
+    uint8_t  a2dp_local_seid;
+    uint8_t  media_aac_codec_configuration[6];
+} a2dp_sink_aac_stream_endpoint_t;
+static a2dp_sink_aac_stream_endpoint_t a2dp_sink_aac_stream_endpoint;
+#endif
+
 #ifdef STORE_TO_WAV_FILE
 static uint32_t audio_frame_count = 0;
 static char * wav_filename = "bt_bridge_audio.wav";
@@ -460,7 +520,15 @@ static uint8_t sbc_frame_storage[(OPTIMAL_FRAMES_MAX + ADDITIONAL_FRAMES) * MAX_
 static btstack_ring_buffer_t sbc_frame_ring_buffer;
 static unsigned int sbc_frame_size;
 
+// overflow buffer for not fully used decoded frames, with additional frames for resampling
+// AAC outputs 1024 samples per frame vs SBC's 128, need space for several AAC frames
+// At 44100 Hz stereo 16-bit: 1 second = 44100 * 4 = 176400 bytes
+// We buffer ~200ms = ~35000 bytes, enough for ~8 AAC frames
+#ifdef HAVE_AAC_FDK
+static uint8_t decoded_audio_storage[8 * 1024 * BYTES_PER_FRAME];  // ~32KB
+#else
 static uint8_t decoded_audio_storage[(128+16) * BYTES_PER_FRAME];
+#endif
 static btstack_ring_buffer_t decoded_audio_ring_buffer;
 
 static int media_initialized = 0;
@@ -724,29 +792,39 @@ static void ipc_poll_timer_handler(btstack_timer_source_t *ts) {
 
 static void playback_handler(int16_t * buffer, uint16_t num_audio_frames, const btstack_audio_context_t * context){
     UNUSED(context);
+    int16_t * original_buffer = buffer;
+    uint16_t  original_frames = num_audio_frames;
+
 #ifdef STORE_TO_WAV_FILE
     int       wav_samples = num_audio_frames * NUM_CHANNELS;
     int16_t * wav_buffer  = buffer;
 #endif
-    // Mute until first AVRCP volume is received from iPhone
-    // This prevents audio glitches during the A2DP/AVRCP sync gap
-    if (volume_percentage < 0 || sbc_frame_size == 0){
-        memset(buffer, 0, num_audio_frames * BYTES_PER_FRAME);
-        return;
-    }
+    // Mute condition: no volume yet, or SBC not ready
+    bool muted = (volume_percentage < 0) || (active_codec == CODEC_SBC && sbc_frame_size == 0);
+
+    // Always consume data from ring buffers to prevent overflow
     uint32_t bytes_read;
     btstack_ring_buffer_read(&decoded_audio_ring_buffer, (uint8_t *) buffer, num_audio_frames * BYTES_PER_FRAME, &bytes_read);
     buffer          += bytes_read / NUM_CHANNELS;
     num_audio_frames   -= bytes_read / BYTES_PER_FRAME;
     request_buffer = buffer;
     request_frames = num_audio_frames;
-    while (request_frames && btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) >= sbc_frame_size){
-        uint8_t sbc_frame[MAX_SBC_FRAME_SIZE];
-        btstack_ring_buffer_read(&sbc_frame_ring_buffer, sbc_frame, sbc_frame_size, &bytes_read);
-        sbc_decoder_instance->decode_signed_16(&sbc_decoder_context, 0, sbc_frame, sbc_frame_size);
+    // SBC: decode frames from ring buffer on demand
+    // AAC: decoded_audio_ring_buffer is filled by handle_aac_media_data directly
+    if (active_codec == CODEC_SBC && sbc_frame_size > 0) {
+        while (request_frames && btstack_ring_buffer_bytes_available(&sbc_frame_ring_buffer) >= sbc_frame_size){
+            uint8_t sbc_frame[MAX_SBC_FRAME_SIZE];
+            btstack_ring_buffer_read(&sbc_frame_ring_buffer, sbc_frame, sbc_frame_size, &bytes_read);
+            sbc_decoder_instance->decode_signed_16(&sbc_decoder_context, 0, sbc_frame, sbc_frame_size);
+        }
+    }
+
+    // If muted, zero out the entire output buffer
+    if (muted) {
+        memset(original_buffer, 0, original_frames * BYTES_PER_FRAME);
     }
 #ifdef STORE_TO_WAV_FILE
-    audio_frame_count += num_audio_frames;
+    audio_frame_count += original_frames;
     wav_writer_write_int16(wav_samples, wav_buffer);
 #endif
 }
@@ -839,7 +917,71 @@ static void media_processing_close(void){
     if (audio){
         audio->close();
     }
+#ifdef HAVE_AAC_FDK
+    if (aac_decoder_handle) {
+        aacDecoder_Close(aac_decoder_handle);
+        aac_decoder_handle = NULL;
+    }
+    aac_decoder_initialized = false;
+    active_codec = CODEC_SBC;  // Reset to default for next connection
+#endif
 }
+
+#ifdef HAVE_AAC_FDK
+// ============================================================================
+// AAC Decoder Management
+// ============================================================================
+
+static int aac_decoder_open(uint32_t sample_rate, uint8_t num_channels) {
+    if (aac_decoder_handle) {
+        aacDecoder_Close(aac_decoder_handle);
+        aac_decoder_handle = NULL;
+    }
+
+    // A2DP AAC from iPhone: LATM AudioMuxElement framing (starts with 0x47 0xFC).
+    // TT_MP4_LATM_MCP1 = LATM with in-band StreamMuxConfig (muxConfigPresent=1).
+    aac_decoder_handle = aacDecoder_Open(TT_MP4_LATM_MCP1, 1);
+    if (!aac_decoder_handle) {
+        printf("AAC: Failed to open decoder\n");
+        return -1;
+    }
+
+    // Set output channel count (required for proper LATM decoding)
+    aacDecoder_SetParam(aac_decoder_handle, AAC_PCM_MIN_OUTPUT_CHANNELS, num_channels);
+    aacDecoder_SetParam(aac_decoder_handle, AAC_PCM_MAX_OUTPUT_CHANNELS, num_channels);
+
+    aac_sample_rate = sample_rate;
+    aac_num_channels = num_channels;
+    aac_decoder_initialized = true;
+    printf("AAC: Decoder opened (TT_MP4_LATM_MCP1, %u Hz, %u ch)\n",
+           sample_rate, num_channels);
+    return 0;
+}
+
+static int media_processing_init_aac(uint32_t sample_rate, uint8_t num_channels) {
+    if (media_initialized) return 0;
+
+    if (aac_decoder_open(sample_rate, num_channels) != 0) {
+        return -1;
+    }
+
+#ifdef STORE_TO_WAV_FILE
+    wav_writer_open(wav_filename, num_channels, sample_rate);
+#endif
+
+    btstack_ring_buffer_init(&decoded_audio_ring_buffer, decoded_audio_storage, sizeof(decoded_audio_storage));
+    btstack_resample_init(&resample_instance, num_channels);
+
+    const btstack_audio_sink_t * audio_out = btstack_audio_sink_get_instance();
+    if (audio_out) {
+        audio_out->init(NUM_CHANNELS, sample_rate, &playback_handler);
+    }
+
+    audio_stream_started = 0;
+    media_initialized = 1;
+    return 0;
+}
+#endif /* HAVE_AAC_FDK */
 
 static void dump_sbc_configuration(media_codec_configuration_sbc_t * configuration){
     printf("    - num_channels: %d\n", configuration->num_channels);
@@ -891,8 +1033,72 @@ static int read_sbc_header(uint8_t * packet, int size, int * offset, avdtp_sbc_c
     return 1;
 }
 
+#ifdef HAVE_AAC_FDK
+// Decode AAC media data packet and feed PCM to audio output
+static void handle_aac_media_data(uint8_t *packet, uint16_t size) {
+    if (!aac_decoder_initialized || !aac_decoder_handle) return;
+
+    // Skip RTP media header (12 bytes)
+    int pos = 0;
+    avdtp_media_packet_header_t media_header;
+    if (!read_media_data_header(packet, size, &pos, &media_header)) return;
+
+    // Remaining data is the AAC LATM frame
+    UCHAR *aac_data = (UCHAR *)(packet + pos);
+    UINT aac_data_len = size - pos;
+    if (aac_data_len == 0) return;
+
+    // Feed to fdk-aac decoder
+    UINT bytes_valid = aac_data_len;
+    UINT buf_size = aac_data_len;
+
+    AAC_DECODER_ERROR err = aacDecoder_Fill(aac_decoder_handle, &aac_data, &buf_size, &bytes_valid);
+    if (err != AAC_DEC_OK) {
+        return;
+    }
+
+    // Decode frame(s)
+    while (1) {
+        err = aacDecoder_DecodeFrame(aac_decoder_handle, aac_pcm_buffer,
+                                      AAC_PCM_FRAME_SIZE * 2, 0);
+        if (err == AAC_DEC_NOT_ENOUGH_BITS) {
+            break;  // Need more data — normal for LATM
+        }
+        if (err != AAC_DEC_OK) {
+            break;
+        }
+
+        CStreamInfo *info = aacDecoder_GetStreamInfo(aac_decoder_handle);
+        if (!info || info->numChannels <= 0) break;
+
+        // Write decoded PCM directly to ring buffer
+        uint32_t bytes_to_write = info->frameSize * BYTES_PER_FRAME;
+        btstack_ring_buffer_write(&decoded_audio_ring_buffer,
+            (uint8_t *)aac_pcm_buffer, bytes_to_write);
+
+        // Start audio output once we have enough buffered data (~3 AAC frames ≈ 70ms)
+        if (!audio_stream_started) {
+            uint32_t decoded_bytes = btstack_ring_buffer_bytes_available(&decoded_audio_ring_buffer);
+            uint32_t threshold = 3 * 1024 * BYTES_PER_FRAME;
+            if (decoded_bytes >= threshold) {
+                media_processing_start();
+            }
+        }
+    }
+}
+#endif /* HAVE_AAC_FDK */
+
 static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t *packet, uint16_t size){
     UNUSED(seid);
+
+#ifdef HAVE_AAC_FDK
+    if (active_codec == CODEC_AAC) {
+        handle_aac_media_data(packet, size);
+        return;
+    }
+#endif
+
+    // ── SBC path ──
     int pos = 0;
     avdtp_media_packet_header_t media_header;
     if (!read_media_data_header(packet, size, &pos, &media_header)) return;
@@ -1467,7 +1673,47 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
 
     switch (packet[2]){
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_OTHER_CONFIGURATION:
-            printf("A2DP: Received non-SBC codec - not implemented\n");
+#ifdef HAVE_AAC_FDK
+        {
+            uint8_t codec_type = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_type(packet);
+            if (codec_type == AVDTP_CODEC_MPEG_2_4_AAC) {
+                printf("A2DP: Received AAC codec configuration\n");
+                active_codec = CODEC_AAC;
+
+                uint16_t info_len = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information_len(packet);
+                const uint8_t * info = a2dp_subevent_signaling_media_codec_other_configuration_get_media_codec_information(packet);
+                if (info_len >= 6) {
+                    memcpy(media_aac_codec_configuration, info, 6);
+                }
+
+                // Decode sampling frequency from config bytes 1-2
+                uint16_t sf_bits = ((uint16_t)media_aac_codec_configuration[1] << 4)
+                                 | (media_aac_codec_configuration[2] >> 4);
+                if      (sf_bits & 0x001) aac_sample_rate = 44100;
+                else if (sf_bits & 0x002) aac_sample_rate = 48000;
+                else if (sf_bits & 0x004) aac_sample_rate = 32000;
+                else if (sf_bits & 0x008) aac_sample_rate = 24000;
+                else if (sf_bits & 0x010) aac_sample_rate = 22050;
+                else if (sf_bits & 0x020) aac_sample_rate = 16000;
+                else if (sf_bits & 0x040) aac_sample_rate = 12000;
+                else if (sf_bits & 0x080) aac_sample_rate = 11025;
+                else if (sf_bits & 0x100) aac_sample_rate = 8000;
+                else aac_sample_rate = 44100;
+
+                // Channels: byte 2, bits 3-2
+                uint8_t ch_bits = (media_aac_codec_configuration[2] >> 2) & 0x03;
+                aac_num_channels = (ch_bits & 0x02) ? 2 : 1;
+
+                printf("    AAC: %u Hz, %u ch, obj_type 0x%02x\n",
+                       aac_sample_rate, aac_num_channels, media_aac_codec_configuration[0]);
+                ipc_send_event_codec("AAC");
+            } else {
+                printf("A2DP: Received non-SBC/AAC codec (type 0x%02x) - not implemented\n", codec_type);
+            }
+        }
+#else
+            printf("A2DP: Received non-SBC codec - not implemented (AAC disabled)\n");
+#endif
             break;
         case A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_SBC_CONFIGURATION:{
             printf("A2DP: Received SBC codec configuration\n");
@@ -1498,6 +1744,8 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
                     break;
             }
             dump_sbc_configuration(&a2dp_conn->sbc_configuration);
+            active_codec = CODEC_SBC;
+            ipc_send_event_codec("SBC");
             break;
         }
         case A2DP_SUBEVENT_STREAM_ESTABLISHED:
@@ -1520,18 +1768,50 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
             a2dp_conn->a2dp_cid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
             a2dp_conn->a2dp_local_seid = a2dp_subevent_stream_established_get_local_seid(packet);
             a2dp_conn->stream_state = STREAM_STATE_OPEN;
-            printf("A2DP: Stream established, addr %s\n", bd_addr_to_str(a2dp_conn->addr));
+
+#ifdef HAVE_AAC_FDK
+            // Detect codec from local SEID if config event was missed
+            if (a2dp_conn->a2dp_local_seid == a2dp_sink_aac_stream_endpoint.a2dp_local_seid) {
+                if (active_codec != CODEC_AAC) {
+                    printf("A2DP: AAC endpoint selected (seid %d), setting codec to AAC\n",
+                           a2dp_conn->a2dp_local_seid);
+                    active_codec = CODEC_AAC;
+                    // Use default AAC params if config event didn't arrive
+                    if (aac_sample_rate == 0) aac_sample_rate = 44100;
+                    if (aac_num_channels == 0) aac_num_channels = 2;
+                    ipc_send_event_codec("AAC");
+                }
+            } else {
+                if (active_codec != CODEC_SBC) {
+                    printf("A2DP: SBC endpoint selected (seid %d)\n", a2dp_conn->a2dp_local_seid);
+                    active_codec = CODEC_SBC;
+                    ipc_send_event_codec("SBC");
+                }
+            }
+#endif
+
+            printf("A2DP: Stream established, addr %s, local seid %d, codec %s\n",
+                   bd_addr_to_str(a2dp_conn->addr), a2dp_conn->a2dp_local_seid,
+                   active_codec == CODEC_AAC ? "AAC" : "SBC");
             memcpy(device_addr, a2dp_conn->addr, 6);
             auto_reconnect_stop();  // Connection succeeded
             break;
 
         case A2DP_SUBEVENT_STREAM_STARTED:
-            printf("A2DP: Stream started\n");
+            printf("A2DP: Stream started (codec: %s)\n", active_codec == CODEC_AAC ? "AAC" : "SBC");
             a2dp_conn->stream_state = STREAM_STATE_PLAYING;
             if (a2dp_conn->sbc_configuration.reconfigure){
                 media_processing_close();
             }
+#ifdef HAVE_AAC_FDK
+            if (active_codec == CODEC_AAC) {
+                media_processing_init_aac(aac_sample_rate, aac_num_channels);
+            } else {
+                media_processing_init(&a2dp_conn->sbc_configuration);
+            }
+#else
             media_processing_init(&a2dp_conn->sbc_configuration);
+#endif
             ipc_send_event_stream_started();
             break;
 
@@ -1589,6 +1869,24 @@ static int setup_demo(void){
                                                                                        stream_endpoint->media_sbc_codec_configuration, sizeof(stream_endpoint->media_sbc_codec_configuration));
     btstack_assert(local_stream_endpoint != NULL);
     stream_endpoint->a2dp_local_seid = avdtp_local_seid(local_stream_endpoint);
+
+#ifdef HAVE_AAC_FDK
+    // Register AAC stream endpoint (unless SBC-only mode)
+    if (strcmp(preferred_codec, "SBC") != 0) {
+        a2dp_sink_aac_stream_endpoint_t * aac_ep = &a2dp_sink_aac_stream_endpoint;
+        avdtp_stream_endpoint_t * aac_local_ep = a2dp_sink_create_stream_endpoint(AVDTP_AUDIO,
+            AVDTP_CODEC_MPEG_2_4_AAC, media_aac_codec_capabilities, sizeof(media_aac_codec_capabilities),
+            aac_ep->media_aac_codec_configuration, sizeof(aac_ep->media_aac_codec_configuration));
+        if (aac_local_ep) {
+            aac_ep->a2dp_local_seid = avdtp_local_seid(aac_local_ep);
+            printf("A2DP: AAC endpoint registered (seid %d)\n", aac_ep->a2dp_local_seid);
+        } else {
+            printf("A2DP: WARNING — failed to create AAC endpoint\n");
+        }
+    } else {
+        printf("A2DP: AAC disabled by --codec SBC\n");
+    }
+#endif
 
     avrcp_register_packet_handler(&avrcp_packet_handler);
     avrcp_controller_register_packet_handler(&avrcp_controller_packet_handler);
@@ -1739,8 +2037,14 @@ static void stdin_process(char cmd){
 
 int btstack_main(int argc, const char * argv[]);
 int btstack_main(int argc, const char * argv[]){
-    UNUSED(argc);
-    (void)argv;
+    // Parse --codec argument: "SBC", "AAC", or "both" (default)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
+            preferred_codec = argv[i + 1];
+            printf("Preferred codec: %s\n", preferred_codec);
+            i++;
+        }
+    }
 
     // Initialize IPC server
     ipc_init();

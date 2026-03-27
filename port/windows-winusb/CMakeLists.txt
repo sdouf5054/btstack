@@ -157,3 +157,31 @@ if(FDK_AAC_FOUND)
     endif()
 endif()
 target_link_libraries(bt_bridge ${BT_BRIDGE_LIBS})
+
+# Auto-copy fdk-aac DLL to build directory (needed for subprocess execution)
+if(FDK_AAC_FOUND AND WIN32)
+    # Find the DLL in MinGW bin directory
+    find_file(FDK_AAC_DLL
+        NAMES libfdk-aac-2.dll fdk-aac-2.dll fdk-aac.dll
+        PATHS
+            "${CMAKE_FIND_ROOT_PATH}/bin"
+            "$ENV{MINGW_PREFIX}/bin"
+            "C:/msys64/mingw64/bin"
+        NO_DEFAULT_PATH
+    )
+    if(NOT FDK_AAC_DLL)
+        # Fallback: search system PATH
+        find_file(FDK_AAC_DLL NAMES libfdk-aac-2.dll fdk-aac-2.dll)
+    endif()
+    if(FDK_AAC_DLL)
+        message("FDK_AAC_DLL: ${FDK_AAC_DLL} — will auto-copy to build dir")
+        add_custom_command(TARGET bt_bridge POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FDK_AAC_DLL}"
+                "$<TARGET_FILE_DIR:bt_bridge>"
+            COMMENT "Copying libfdk-aac DLL to build directory"
+        )
+    else()
+        message(WARNING "libfdk-aac DLL not found — you may need to copy it manually to the build directory")
+    endif()
+endif()

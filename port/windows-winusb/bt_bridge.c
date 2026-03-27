@@ -6,7 +6,7 @@
  *   - TCP IPC server (port 9876) sends JSON events to Python GUI
  *   - Auto metadata request on track change
  *   - Auto cover art download on new image handle
- *   - Command reception from TCP clients (play/pause/next/prev/volume)
+ *   - Command reception from TCP clients (play/pause/next/prev)
  *
  * Original copyright: BlueKitchen GmbH, non-commercial license.
  */
@@ -379,12 +379,6 @@ static void ipc_send_event_playback(const char *status) {
     ipc_send_json(buf);
 }
 
-static void ipc_send_event_volume(int percent, int raw) {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "{\"type\":\"volume\",\"percent\":%d,\"raw\":%d}", percent, raw);
-    ipc_send_json(buf);
-}
-
 static void ipc_send_event_stream_started(void) {
     ipc_send_json("{\"type\":\"stream_started\"}");
 }
@@ -396,6 +390,12 @@ static void ipc_send_event_stream_stopped(void) {
 static void ipc_send_event_codec(const char *codec_name) {
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"type\":\"codec\",\"name\":\"%s\"}", codec_name);
+    ipc_send_json(buf);
+}
+
+static void ipc_send_event_a2dp_connected(const char *addr) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"type\":\"a2dp_connected\",\"addr\":\"%s\"}", addr);
     ipc_send_json(buf);
 }
 
@@ -541,7 +541,6 @@ static btstack_resample_t resample_instance;
 static int16_t * request_buffer;
 static int       request_frames;
 
-static int volume_percentage = -1;  // -1 = unknown until first sync from device
 static avrcp_battery_status_t battery_status = AVRCP_BATTERY_STATUS_WARNING;
 
 #ifdef ENABLE_AVRCP_COVER_ART
@@ -680,7 +679,6 @@ static void handle_l2cap_media_data_packet(uint8_t seid, uint8_t *packet, uint16
 static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
-static void avrcp_volume_changed(uint8_t volume);
 #ifdef HAVE_BTSTACK_STDIN
 static void stdin_process(char cmd);
 #endif
@@ -799,8 +797,10 @@ static void playback_handler(int16_t * buffer, uint16_t num_audio_frames, const 
     int       wav_samples = num_audio_frames * NUM_CHANNELS;
     int16_t * wav_buffer  = buffer;
 #endif
-    // Mute condition: no volume yet, or SBC not ready
-    bool muted = (volume_percentage < 0) || (active_codec == CODEC_SBC && sbc_frame_size == 0);
+    // Mute condition: SBC codec not ready (waiting for first frame to determine frame size)
+    // Volume is NOT a mute condition — we play at full output and let the source device
+    // (iPhone) control the audio level, avoiding double-attenuation.
+    bool muted = (active_codec == CODEC_SBC && sbc_frame_size == 0);
 
     // Always consume data from ring buffers to prevent overflow
     uint32_t bytes_read;
@@ -869,6 +869,9 @@ static int media_processing_init(media_codec_configuration_sbc_t * configuration
     const btstack_audio_sink_t * audio = btstack_audio_sink_get_instance();
     if (audio){
         audio->init(NUM_CHANNELS, configuration->sampling_frequency, &playback_handler);
+        // Start at max volume so audio plays immediately.
+        // AVRCP will sync the correct level once it connects.
+        audio->set_volume(127);
     }
     audio_stream_started = 0;
     media_initialized = 1;
@@ -975,6 +978,9 @@ static int media_processing_init_aac(uint32_t sample_rate, uint8_t num_channels)
     const btstack_audio_sink_t * audio_out = btstack_audio_sink_get_instance();
     if (audio_out) {
         audio_out->init(NUM_CHANNELS, sample_rate, &playback_handler);
+        // Start at max volume so audio plays immediately.
+        // AVRCP will sync the correct level once it connects.
+        audio_out->set_volume(127);
     }
 
     audio_stream_started = 0;
@@ -1071,14 +1077,43 @@ static void handle_aac_media_data(uint8_t *packet, uint16_t size) {
         CStreamInfo *info = aacDecoder_GetStreamInfo(aac_decoder_handle);
         if (!info || info->numChannels <= 0) break;
 
-        // Write decoded PCM directly to ring buffer
-        uint32_t bytes_to_write = info->frameSize * BYTES_PER_FRAME;
-        btstack_ring_buffer_write(&decoded_audio_ring_buffer,
-            (uint8_t *)aac_pcm_buffer, bytes_to_write);
+        int num_decoded_frames = info->frameSize;
+
+        // ── Drift compensation ──
+        // Monitor ring buffer fill level and adjust resample factor.
+        // Target: keep ~4 AAC frames (~4096 samples = 16384 bytes) buffered.
+        // If buffer runs low, slow down playback (factor < nominal).
+        // If buffer fills up, speed up playback (factor > nominal).
+        uint32_t nominal_factor = 0x10000;  // Q16 fixed-point 1.0
+        uint32_t compensation   = 0x00100;  // ~0.4% adjustment step
+        uint32_t decoded_bytes = btstack_ring_buffer_bytes_available(&decoded_audio_ring_buffer);
+        // Thresholds in bytes: 1 AAC frame = 1024 * 4 = 4096 bytes
+        uint32_t low_water  = 2 * 1024 * BYTES_PER_FRAME;  // ~2 frames = 8192
+        uint32_t high_water = 6 * 1024 * BYTES_PER_FRAME;  // ~6 frames = 24576
+        uint32_t resampling_factor;
+        if (decoded_bytes < low_water) {
+            resampling_factor = nominal_factor - compensation;  // slow down output
+        } else if (decoded_bytes > high_water) {
+            resampling_factor = nominal_factor + compensation;  // speed up output
+        } else {
+            resampling_factor = nominal_factor;  // no adjustment
+        }
+        btstack_resample_set_factor(&resample_instance, resampling_factor);
+
+        // Resample and write to ring buffer
+        int16_t resampled_buf[(1024 + 16) * NUM_CHANNELS];
+        uint32_t resampled_frames = btstack_resample_block(&resample_instance,
+            (int16_t *)aac_pcm_buffer, num_decoded_frames, resampled_buf);
+
+        if (resampled_frames > 0) {
+            uint32_t bytes_to_write = resampled_frames * BYTES_PER_FRAME;
+            btstack_ring_buffer_write(&decoded_audio_ring_buffer,
+                (uint8_t *)resampled_buf, bytes_to_write);
+        }
 
         // Start audio output once we have enough buffered data (~3 AAC frames ≈ 70ms)
         if (!audio_stream_started) {
-            uint32_t decoded_bytes = btstack_ring_buffer_bytes_available(&decoded_audio_ring_buffer);
+            decoded_bytes = btstack_ring_buffer_bytes_available(&decoded_audio_ring_buffer);
             uint32_t threshold = 3 * 1024 * BYTES_PER_FRAME;
             if (decoded_bytes >= threshold) {
                 media_processing_start();
@@ -1374,7 +1409,9 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             last_connected_addr_valid = true;
             auto_reconnect_save_addr(address);
 
-            avrcp_target_support_event(connection->avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+            // NOTE: VOLUME_CHANGED event registration DISABLED to test if
+            // iPhone sends full-scale PCM when it thinks Sink can't control volume.
+            // avrcp_target_support_event(connection->avrcp_cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
             avrcp_target_support_event(connection->avrcp_cid, AVRCP_NOTIFICATION_EVENT_BATT_STATUS_CHANGED);
             avrcp_target_battery_status_changed(connection->avrcp_cid, battery_status);
             avrcp_controller_get_supported_events(connection->avrcp_cid);
@@ -1387,7 +1424,6 @@ static void avrcp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
             printf("AVRCP: Channel released: cid 0x%02x\n", avrcp_subevent_connection_released_get_avrcp_cid(packet));
             connection->avrcp_cid = 0;
             connection->notifications_supported_by_target = 0;
-            volume_percentage = -1;
             ipc_send_event_disconnected();
             return;
         default:
@@ -1621,33 +1657,15 @@ static void avrcp_controller_packet_handler(uint8_t packet_type, uint16_t channe
 #endif
 }
 
-// Volume: PortAudio output is always at max (127).
-// Actual volume control is handled by the iPhone (source device),
-// just like a normal Bluetooth speaker.
-// We only track volume_percentage for IPC reporting to the GUI.
-
-static void avrcp_volume_changed(uint8_t volume){
-    const btstack_audio_sink_t * audio = btstack_audio_sink_get_instance();
-    if (audio){
-        audio->set_volume(volume);
-    }
-}
-
 static void avrcp_target_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size){
     UNUSED(channel);
     UNUSED(size);
     if (packet_type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
 
-    uint8_t volume;
     switch (packet[2]){
-        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
-            volume = avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
-            volume_percentage = volume * 100 / 127;
-            printf("AVRCP: Volume %d%% (%d)\n", volume_percentage, volume);
-            avrcp_volume_changed(volume);
-            ipc_send_event_volume(volume_percentage, volume);
-            break;
+        // Volume events no longer arrive — Absolute Volume is disabled
+        // (AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED not registered)
         case AVRCP_SUBEVENT_OPERATION:
             break;
         default:
@@ -1795,6 +1813,11 @@ static void a2dp_sink_packet_handler(uint8_t packet_type, uint16_t channel, uint
                    active_codec == CODEC_AAC ? "AAC" : "SBC");
             memcpy(device_addr, a2dp_conn->addr, 6);
             auto_reconnect_stop();  // Connection succeeded
+
+            // Notify GUI immediately at A2DP level (don't wait for AVRCP)
+            // This eliminates the multi-second gap where the phone shows "connected"
+            // but the GUI still says "initializing"
+            ipc_send_event_a2dp_connected(bd_addr_to_str(a2dp_conn->addr));
             break;
 
         case A2DP_SUBEVENT_STREAM_STARTED:
@@ -1910,7 +1933,9 @@ static int setup_demo(void){
     sdp_register_service(sdp_avrcp_controller_service_buffer);
 
     memset(sdp_avrcp_target_service_buffer, 0, sizeof(sdp_avrcp_target_service_buffer));
-    uint16_t target_supported_features = 1 << AVRCP_TARGET_SUPPORTED_FEATURE_CATEGORY_MONITOR_OR_AMPLIFIER;
+    // NOTE: Using CATEGORY_PLAYER (not MONITOR_OR_AMPLIFIER) to prevent iPhone
+    // from engaging Absolute Volume mode, which causes it to pre-attenuate PCM.
+    uint16_t target_supported_features = 1 << AVRCP_TARGET_SUPPORTED_FEATURE_CATEGORY_PLAYER_OR_RECORDER;
     avrcp_target_create_sdp_record(sdp_avrcp_target_service_buffer,
                                    sdp_create_service_record_handle(), target_supported_features, NULL, NULL);
     btstack_assert(de_get_len(sdp_avrcp_target_service_buffer) <= sizeof(sdp_avrcp_target_service_buffer));
@@ -1973,7 +1998,6 @@ static void stdin_process(char cmd){
             printf("L - pause\n");
             printf("i - forward\n");
             printf("I - backward\n");
-            printf("t/T - volume up/down\n");
 #ifdef ENABLE_AVRCP_COVER_ART
             printf("@ - download cover art\n");
 #endif
@@ -1996,22 +2020,6 @@ static void stdin_process(char cmd){
             break;
         case 'I':
             status = avrcp_controller_backward(avrcp_connection->avrcp_cid);
-            break;
-        case 't':
-            if (volume_percentage < 0) volume_percentage = 50;
-            volume_percentage = volume_percentage <= 90 ? volume_percentage + 10 : 100;
-            {
-                uint8_t volume = volume_percentage * 127 / 100;
-                status = avrcp_controller_set_absolute_volume(avrcp_connection->avrcp_cid, volume);
-            }
-            break;
-        case 'T':
-            if (volume_percentage < 0) volume_percentage = 50;
-            volume_percentage = volume_percentage >= 10 ? volume_percentage - 10 : 0;
-            {
-                uint8_t volume = volume_percentage * 127 / 100;
-                status = avrcp_controller_set_absolute_volume(avrcp_connection->avrcp_cid, volume);
-            }
             break;
 #ifdef ENABLE_AVRCP_COVER_ART
         case '@':

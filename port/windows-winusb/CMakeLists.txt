@@ -185,3 +185,28 @@ if(FDK_AAC_FOUND AND WIN32)
         message(WARNING "libfdk-aac DLL not found — you may need to copy it manually to the build directory")
     endif()
 endif()
+
+if(WIN32)
+    foreach(DLL
+        libgcc_s_seh-1.dll
+        libwinpthread-1.dll
+        libstdc++-6.dll
+        libfdk-aac-2.dll
+    )
+        find_file(FOUND_${DLL} ${DLL}
+            PATHS 
+                "$ENV{MINGW_PREFIX}/bin"
+                "$ENV{MSYS2_ROOT}/mingw64/bin"
+                "C:/msys64/mingw64/bin"
+                "C:/msys2/mingw64/bin"
+            NO_DEFAULT_PATH
+        )
+        if(FOUND_${DLL})
+            add_custom_command(TARGET bt_bridge POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${FOUND_${DLL}}"
+                    "$<TARGET_FILE_DIR:bt_bridge>"
+            )
+        endif()
+    endforeach()
+endif()

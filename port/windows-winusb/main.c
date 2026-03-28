@@ -169,6 +169,12 @@ int main(int argc, const char * argv[]){
     // init HCI
     hci_init(hci_transport_usb_instance(), NULL);
 
+    // ★ Force Realtek chipset for TP-Link UB500 (WinUSB transport
+    //    doesn't emit HCI_EVENT_TRANSPORT_USB_INFO)
+    btstack_chipset_realtek_set_product_id(0x0604);
+    hci_set_chipset(btstack_chipset_realtek_instance());
+    hci_enable_custom_pre_init();
+
     // register known Realtek USB Controllers
     uint16_t realtek_num_controllers = btstack_chipset_realtek_get_num_usb_controllers();
     uint16_t i;
